@@ -1,6 +1,9 @@
 import { type NextRequest } from "next/server";
 import util from "util";
-
+import axios from "axios";
+import { Root, tryTikwm } from "@lta/app/api/ytb-dlp/types/tikwm";
+import client, { connect } from "@lta/utils/redis";
+import _ from "lodash";
 const exec = util.promisify(require("child_process").exec);
 export const dynamic = "force-dynamic";
 type Nullable<T> = T | null;
@@ -28,18 +31,17 @@ type DataResponseMainType = {
 type DataResponseType = DataResponseMainType &
     (DataResponseSuccessType | DataResponseFailedType);
 
-type VideoType = Nullable<"tiktok" | "youtube">;
+let connectRedis = 0;
 
 export async function GET(req: NextRequest) {
     const searchParams = req.nextUrl.searchParams;
     const now = performance.now();
-    const url = searchParams.get("url");
-    let video_type: VideoType;
-    if (url?.includes("youtube")) {
-        video_type = "youtube";
-    } else {
-        video_type = "tiktok";
+    const url = searchParams.get("url")!;
+    if (connectRedis === 0) {
+        await connect();
+        connectRedis = 1;
     }
+    if (_.isEmpty(url)) throw new Error("Empty url");
 
     const resMain: DataResponseMainType = { message: "", time: 0 };
     const resSuccess: DataResponseSuccessType = {
@@ -48,11 +50,45 @@ export async function GET(req: NextRequest) {
     };
     const resFailed: DataResponseFailedType = { status: "error", error: "" };
     try {
-        const { stdout: rawData, stderr } = await exec(
-            `yt-dlp -g -e --get-duration --get-thumbnail ${url}`,
-        );
+        if (url?.includes("tiktok")) {
+            const cachedData = await client.hGetAll("tik" + url);
+            let data;
+            if (!_.isEmpty(cachedData)) {
+                data = cachedData;
+            } else {
+                const tikwm = await tryTikwm(url!);
+                if (tikwm) {
+                    data = {
+                        thumbnail: tikwm.data.cover,
+                        url: tikwm.data.play,
+                        title: tikwm.data.title,
+                        music: tikwm.data.music,
+                        duration: tikwm.data.duration,
+                        description: tikwm.data.title,
+                    };
+                    await client.hSet("tik" + url, data);
+                    await client.expire("tik" + url, 60 * 60 * 24);
+                }
+            }
+            return Response.json({
+                message: "Get video success.",
+                data,
+            } as DataResponseType);
+        }
+        const cachedData = await client.get(url);
+        let data: string[];
+        if (_.isEmpty(cachedData)) {
+            const { stdout: rawData } = await exec(
+                `yt-dlp -g -e --get-duration --get-thumbnail ${url}`,
+            );
+            data = rawData.split("\n").filter((el: string) => el);
+            await client.set(url, JSON.stringify(data));
+            await client.expire(url, 60 * 60 * 24);
+        } else {
+            data = JSON.parse(cachedData!);
+        }
         resMain.message = "Get video success.";
-        const data = rawData.split("\n").filter((el: string) => el);
+
         if (url?.includes("youtube")) {
             resSuccess.data = {
                 title: data[0],
@@ -85,7 +121,7 @@ export async function GET(req: NextRequest) {
             } as VideoData;
         }
 
-        resSuccess.raw = rawData;
+        //resSuccess.raw = rawData;
     } catch (e) {
         resMain.message = "Get video failed.";
         resFailed.error = (e as unknown as Error).toString();
